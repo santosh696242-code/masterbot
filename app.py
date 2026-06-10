@@ -15,9 +15,13 @@ from flask import Flask
 
 # --- SETUP CONFIGURATION ---
 MASTER_BOT_TOKEN = "8688021018:AAG6svktpklBybWqM-9qQITCUAJvVuALIOo"
-
+# Render Environment Variable se Groq API Keys fetch karna (comma se separate karke)
 GROQ_API_KEYS_ENV = os.environ.get("GROQ_API_KEYS", "")
 GROQ_API_KEYS = [key.strip() for key in GROQ_API_KEYS_ENV.split(",") if key.strip()]
+
+# Agar env variable set nahi hai to array empty na ho jisse error na aaye
+if not GROQ_API_KEYS:
+    GROQ_API_KEYS = ["SET_YOUR_GROQ_API_KEY_IN_ENV_VARIABLES"]
 
 current_key_index = 0
 ai_client = Groq(api_key=GROQ_API_KEYS[current_key_index])
