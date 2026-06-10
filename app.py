@@ -25,7 +25,7 @@ for key_name in ["GROQ_API_KEYS"] + [f"GROQ_API_KEYS{i}" for i in range(1, 20)]:
 
 # Agar environment variables me kuch nahi mila to default fallback use karein
 if not GROQ_API_KEYS:
-    GROQ_API_KEYS = ["fg"]
+    GROQ_API_KEYS = ["fgfg"]
 
 current_key_index = 0
 ai_client = Groq(api_key=GROQ_API_KEYS[current_key_index].strip())
@@ -201,8 +201,9 @@ def get_user_limits(chat_id):
 
 def activate_token_in_db(chat_id, token):
     """
-    Token REPLACE logic: Naya token milne par user ke purane saare rows me naya plan 
-    aur token replace ho jayega (New row add nahi hoga jisse limits track sahi rahein).
+    Token REPLACE logic: Jab /activate hoga, tab Temp column se naya plan uthaya jayega,
+    aur us user ke pehle ke sabhi rows me Status aur PlanToken bilkul naye wale se replace kar diye jayenge.
+    Old plan details puri tarah hat jayenge.
     """
     global sheet
     if sheet is None:
@@ -212,42 +213,43 @@ def activate_token_in_db(chat_id, token):
         token_row_idx = -1
         row_status = "Standard"
 
-        # Find the row containing the fresh unused token
+        # 1. Naya token find karein (jo abhi tak kisi Admin_ID se linked na ho)
         for i, row in enumerate(records):
             if str(row.get('PlanToken', '')).strip() == token and not str(row.get('Admin_ID', '')).strip():
                 token_row_idx = i + 2 # +2 due to header and 0-index
+                # Temp Column (Col K) se asli plan status read karein
                 row_status = str(row.get('Temp', 'Trial')).strip()
                 if not row_status:
                     row_status = "Standard"
                 break
 
         if token_row_idx == -1:
-            # Check if already activated by this user
+            # Check karein ki user ne yeh pehle hi activate toh nahi kar liya
             for row in records:
                 if str(row.get('PlanToken', '')).strip() == token and str(row.get('Admin_ID', '')).strip() == str(chat_id):
                     return None, "Ye plan aapne pehle hi activate kar liya hai!"
             return None, "Token valid nahi mila ya pehle kisi aur dwara use kiya ja chuka hai."
 
-        # Find if user already has existing bots/rows
+        # 2. Find karein ki is user ki purani details database me hain ya nahi
         admin_rows_indices = []
         for i, row in enumerate(records):
             if str(row.get('Admin_ID', '')).strip() == str(chat_id):
                 admin_rows_indices.append(i + 2)
 
         if admin_rows_indices:
-            # USER EXISTS: Replace all their old plans/tokens with the new one
+            # USER EXISTS: User ke existing sabhi bots me purana status/token replace karke naya lagayein
             for row_idx in admin_rows_indices:
-                # Update Status (Col 6)
+                # Update Status in Column F (Index 6)
                 sheet.update_cell(row_idx, 6, row_status)
-                # Update PlanToken (Col 7)
+                # Update PlanToken in Column G (Index 7)
                 sheet.update_cell(row_idx, 7, token)
             
-            # Delete the unassigned token row to avoid adding a blank/ghost row for the user
+            # Owner bot dwara banayi gayi blank/temp row ko delete kar dein taaki kachra na ho
             sheet.delete_row(token_row_idx)
         else:
-            # NEW USER (No existing bots): Just assign ID and Status to the token row
+            # NEW USER: Ekdum naya user hai, toh us blank row ko assign kar dein
             sheet.update_cell(token_row_idx, 1, str(chat_id)) # Col 1 is Admin_ID
-            sheet.update_cell(token_row_idx, 6, row_status)   # Col 6 is Status
+            sheet.update_cell(token_row_idx, 6, row_status)   # Col 6 is Status (Replace Temp value)
                 
         plan_name, max_bots, max_chars, is_trial = parse_status(row_status)
         return {
@@ -340,21 +342,14 @@ def save_to_sheet(admin_id, bot_token, username, context_data):
 
     context_str = str(context_data) if context_data else "No Context"
     
-    # 50,000 cell limit se bachne ke liye data ko 49000 chars ke chunks me todna
-    CHUNK_SIZE = 49000
-    chunks = [context_str[i:i+CHUNK_SIZE] for i in range(0, len(context_str), CHUNK_SIZE)]
-    if not chunks:
-        chunks = ["No Context"]
+    # New row structure: [Admin_ID, Bot_Token, Username, Context, Join_Date, Status, PlanToken]
+    new_row = [str(admin_id), str(bot_token), str(username), context_str, join_date, active_status, active_token]
     
     max_retries = 3
     for attempt in range(max_retries):
         try:
             print(f"Database me data save kar raha hoon... (Attempt {attempt + 1}/{max_retries})")
-            for chunk in chunks:
-                new_row = [str(admin_id), str(bot_token), str(username), chunk, join_date, active_status, active_token]
-                sheet.append_row(new_row)
-                time.sleep(1) # Multiple rows limit na lage isliye delay
-            
+            sheet.append_row(new_row)
             print("Data system database me safely save ho gaya!")
             bot_tokens_cache[username.lower()] = bot_token
             return join_date
@@ -371,47 +366,14 @@ def append_context_to_sheet(token, extra_context):
         return False
     try:
         records = sheet.get_all_records()
-        
-        bot_rows = []
-        admin_id, username, status, plan_token, join_date = "", "", "", "", ""
-        
-        # Purane sabhi rows find karein
         for i, row in enumerate(records):
             if str(row.get('Bot_Token', '')).strip() == str(token).strip():
-                bot_rows.append({'index': i + 2, 'context': str(row.get('Context', ''))})
-                if not admin_id:
-                    admin_id = str(row.get('Admin_ID', ''))
-                    username = str(row.get('Username', ''))
-                    status = str(row.get('Status', ''))
-                    plan_token = str(row.get('PlanToken', ''))
-                    join_date = str(row.get('Join_Date', ''))
-        
-        if not bot_rows:
-            return None
-            
-        # Purana sara data combine karein aur naya data add karein
-        full_context = ""
-        for r in bot_rows:
-            full_context += r['context'] + "\n\n"
-        full_context += "--- Extra Data ---\n\n" + extra_context
-        
-        # Fir se data chunk karein naye size ke anusaar
-        CHUNK_SIZE = 49000
-        chunks = [full_context[i:i+CHUNK_SIZE] for i in range(0, len(full_context), CHUNK_SIZE)]
-        
-        for j, chunk in enumerate(chunks):
-            if j < len(bot_rows):
-                # Agar row pehle se hai to update karein
-                row_idx = bot_rows[j]['index']
-                sheet.update_cell(row_idx, 4, chunk)
-                time.sleep(1)
-            else:
-                # Limit cross hui to naya row banayein (Doosra Row)
-                new_row = [admin_id, token, username, chunk, join_date, status, plan_token]
-                sheet.append_row(new_row)
-                time.sleep(1)
+                existing_context = str(row.get('Context', ''))
+                updated_context = existing_context + "\n\n--- Extra Data ---\n\n" + extra_context
                 
-        return full_context
+                sheet.update_cell(i + 2, 4, updated_context)
+                return updated_context
+        return None
     except Exception as e:
         print(f"Error updating DB: {e}")
         return False
@@ -501,7 +463,6 @@ def start_client_bot(token, context, join_date_str, status="Trial"):
                     f"• <b>Telegram DM:</b> {DEVELOPER_TELEGRAM}\n"
                     f"• <b>WhatsApp:</b> {ADMIN_PHONE}\n"
                     f"• <b>Emails:</b> {ADMIN_EMAIL_1}, {ADMIN_EMAIL_2}\n\n"
-                    f"🤖 help for @santosh_devloperbot and /help
                     "<i>Apne AI assistant ko dobara active karne ke liye abhi contact karein!</i>"
                 )
                 client_bot.reply_to(message, expired_msg, parse_mode="HTML")
