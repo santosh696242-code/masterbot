@@ -1,0 +1,7 @@
+pyTelegramBotAPI
+gspread
+oauth2client
+groq
+beautifulsoup4
+requests
+flask
