@@ -1,30 +1,34 @@
 import telebot
 import gspread
 import requests
+import json
+import base64
 from bs4 import BeautifulSoup
 from datetime import datetime
 import os
 import threading
-import json
-import base64
 from groq import Groq
 import time
 from urllib.parse import urlparse, urljoin
-from telebot import apihelper
+from oauth2client.service_account import ServiceAccountCredentials
 from flask import Flask
 
 # --- SETUP CONFIGURATION ---
 MASTER_BOT_TOKEN = "8688021018:AAG6svktpklBybWqM-9qQITCUAJvVuALIOo"
-# Render Environment Variable se Groq API Keys fetch karna (comma se separate karke)
-GROQ_API_KEYS_ENV = os.environ.get("GROQ_API_KEYS", "")
-GROQ_API_KEYS = [key.strip() for key in GROQ_API_KEYS_ENV.split(",") if key.strip()]
 
-# Agar env variable set nahi hai to array empty na ho jisse error na aaye
+# Environment se multiple GROQ keys fetch karna
+GROQ_API_KEYS = []
+for key_name in ["GROQ_API_KEYS"] + [f"GROQ_API_KEYS{i}" for i in range(1, 20)]:
+    val = os.environ.get(key_name)
+    if val and val.strip():
+        GROQ_API_KEYS.append(val.strip())
+
+# Agar environment variables me kuch nahi mila to default fallback use karein
 if not GROQ_API_KEYS:
-    GROQ_API_KEYS = ["SET_YOUR_GROQ_API_KEY_IN_ENV_VARIABLES"]
+    GROQ_API_KEYS = ["df"]
 
 current_key_index = 0
-ai_client = Groq(api_key=GROQ_API_KEYS[current_key_index])
+ai_client = Groq(api_key=GROQ_API_KEYS[current_key_index].strip())
 master_bot = telebot.TeleBot(MASTER_BOT_TOKEN)
 admin_states = {}
 
@@ -34,22 +38,19 @@ ADMIN_PHONE = "7858979517"
 ADMIN_EMAIL_1 = "maksudanyadav814@gmail.com"
 ADMIN_EMAIL_2 = "sk747460950@gmail.com"
 
-# Active bots ka cache system
+# Active bots ka context, status aur tokens track karne ke liye dict
 bot_contexts = {} 
 bot_statuses = {}
-bot_tokens_cache = {} 
-active_client_threads = {}  # Token -> Thread reference
-active_client_instances = {}  # Token -> Bot Instance reference
+bot_tokens_cache = {} # Username -> Token mapping ke liye fast cache
 
-# --- DATABASE SETUP (SCANNER-PROOF) ---
+# --- DATABASE SETUP (DRIVE + BASE64 BACKUP) ---
 sheet = None 
 try:
     print("Master Bot: Database se connect karne ki koshish kar raha hoon...")
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    
     creds_dict = None
     
-    # METHOD 1: Try to fetch credentials directly from your Google Drive link
+    # METHOD 1: Google Drive se download karein
     try:
         print("Master Bot: Downloading fresh credentials from Google Drive...")
         drive_url = "https://drive.google.com/uc?export=download&id=1tsPWNQOD0S90Szv3vbB-v76dgrLzSXhO"
@@ -60,7 +61,7 @@ try:
     except Exception as download_error:
         print(f"Master Bot: Google Drive download failed ({download_error}). Moving to secure backup...")
         
-    # METHOD 2: Fallback to secure Base64 embedded credentials (Scanner-proof)
+    # METHOD 2: Secure Base64 fallback agar Drive fail ho jaye
     if not creds_dict:
         print("Master Bot: Loading secure base64-encoded backup credentials...")
         b64_creds = (
@@ -104,12 +105,10 @@ try:
             "aWdodC00MDk4MDkuaWFtLmdzZXJ2aWNlYWNjb3VudC5jb20iLCAidW5pdmVyc2VfZG9t"
             "YWluIjogImdvb2dsZWFwaXMuY29tIn0="
         )
-        from oauth2client.service_account import ServiceAccountCredentials
         decoded_data = base64.b64decode(b64_creds).decode('utf-8')
         creds_dict = json.loads(decoded_data)
         print("Master Bot: Secure backup credentials parsed successfully!")
 
-    from oauth2client.service_account import ServiceAccountCredentials
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
     
@@ -120,8 +119,16 @@ except Exception as e:
     print(f"Master Bot Connection Error: {e}")
 
 # --- HELPER FUNCTIONS ---
+def rotate_api_key():
+    global current_key_index, ai_client
+    current_key_index = (current_key_index + 1) % len(GROQ_API_KEYS)
+    new_key = GROQ_API_KEYS[current_key_index].strip()
+    ai_client = Groq(api_key=new_key)
+    print(f"API Key limit reached! Switched to Key Index {current_key_index}")
+
 def parse_status(status_str):
     status_str = str(status_str).strip().lower()
+    
     plan_name = "Trial"
     max_bots = 1
     max_chars = 15000
@@ -129,7 +136,7 @@ def parse_status(status_str):
 
     if "premium" in status_str or "platinum" in status_str or "unlimited" in status_str:
         plan_name = "Premium"
-        max_bots = 999  
+        max_bots = 999  # Unlimited
         max_chars = 50000
         is_trial = False
     elif "standard" in status_str:
@@ -157,511 +164,739 @@ def parse_status(status_str):
             
     return plan_name, max_bots, max_chars, is_trial
 
+def get_user_limits(chat_id):
+    global sheet
+    plan_name = "Trial"
+    max_bots = 1
+    max_chars = 15000
+    is_trial = True
+    user_bots_count = 0
+    
+    if sheet is None:
+        return plan_name, max_bots, max_chars, is_trial, 0
+        
+    try:
+        records = sheet.get_all_records()
+        user_rows = [row for row in records if str(row.get('Admin_ID', '')).strip() == str(chat_id)]
+        
+        user_bots_count = sum(1 for r in user_rows if str(r.get('Bot_Token', '')).strip())
+        
+        for row in user_rows:
+            status = str(row.get('Status', 'Trial')).strip()
+            p_name, m_bots, m_chars, t_trial = parse_status(status)
+            
+            if m_bots > max_bots:
+                max_bots = m_bots
+            if m_chars > max_chars:
+                max_chars = m_chars
+            if not t_trial:
+                is_trial = False
+                plan_name = p_name
+    except Exception as e:
+        print("Error fetching user limits from DB:", e)
+        
+    return plan_name, max_bots, max_chars, is_trial, user_bots_count
+
+def activate_token_in_db(chat_id, token):
+    """
+    Token REPLACE logic: Naya token milne par user ke purane saare rows me naya plan 
+    aur token replace ho jayega (New row add nahi hoga jisse limits track sahi rahein).
+    """
+    global sheet
+    if sheet is None:
+        return None, "System Database connected nahi hai."
+    try:
+        records = sheet.get_all_records()
+        token_row_idx = -1
+        row_status = "Standard"
+
+        # Find the row containing the fresh unused token
+        for i, row in enumerate(records):
+            if str(row.get('PlanToken', '')).strip() == token and not str(row.get('Admin_ID', '')).strip():
+                token_row_idx = i + 2 # +2 due to header and 0-index
+                row_status = str(row.get('Temp', 'Trial')).strip()
+                if not row_status:
+                    row_status = "Standard"
+                break
+
+        if token_row_idx == -1:
+            # Check if already activated by this user
+            for row in records:
+                if str(row.get('PlanToken', '')).strip() == token and str(row.get('Admin_ID', '')).strip() == str(chat_id):
+                    return None, "Ye plan aapne pehle hi activate kar liya hai!"
+            return None, "Token valid nahi mila ya pehle kisi aur dwara use kiya ja chuka hai."
+
+        # Find if user already has existing bots/rows
+        admin_rows_indices = []
+        for i, row in enumerate(records):
+            if str(row.get('Admin_ID', '')).strip() == str(chat_id):
+                admin_rows_indices.append(i + 2)
+
+        if admin_rows_indices:
+            # USER EXISTS: Replace all their old plans/tokens with the new one
+            for row_idx in admin_rows_indices:
+                # Update Status (Col 6)
+                sheet.update_cell(row_idx, 6, row_status)
+                # Update PlanToken (Col 7)
+                sheet.update_cell(row_idx, 7, token)
+            
+            # Delete the unassigned token row to avoid adding a blank/ghost row for the user
+            sheet.delete_row(token_row_idx)
+        else:
+            # NEW USER (No existing bots): Just assign ID and Status to the token row
+            sheet.update_cell(token_row_idx, 1, str(chat_id)) # Col 1 is Admin_ID
+            sheet.update_cell(token_row_idx, 6, row_status)   # Col 6 is Status
+                
+        plan_name, max_bots, max_chars, is_trial = parse_status(row_status)
+        return {
+            'plan_name': plan_name,
+            'max_bots': max_bots,
+            'max_chars': max_chars,
+            'status': row_status,
+        }, None
+    except Exception as e:
+        print("Token activation error:", e)
+        return None, f"Database update fail ho gaya: {e}"
+
+def extract_text_from_url(base_url, max_pages=5, max_chars=15000):
+    try:
+        visited = set()
+        urls_to_visit = [base_url]
+        domain = urlparse(base_url).netloc
+        all_text = ""
+
+        while urls_to_visit and len(visited) < max_pages:
+            current_url = urls_to_visit.pop(0)
+            if current_url in visited:
+                continue
+            
+            visited.add(current_url)
+            try:
+                response = requests.get(current_url, timeout=5)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                paragraphs = soup.find_all('p')
+                page_text = ' '.join([p.get_text() for p in paragraphs])
+                all_text += f" {page_text}"
+
+                for link in soup.find_all('a', href=True):
+                    next_url = urljoin(base_url, link['href'])
+                    if urlparse(next_url).netloc == domain and next_url not in visited:
+                        urls_to_visit.append(next_url)
+
+            except Exception as e:
+                print(f"Skipping url {current_url}: {e}")
+                
+        return all_text[:max_chars] 
+    except Exception as e:
+        print("Scraping Error:", e)
+        return None
+
 def check_trial_status(join_date_str):
     try:
-        join_date = datetime.strptime(join_date_str.strip(), "%Y-%m-%d %H:%M:%S")
-        days_passed = (datetime.now() - join_date).days
-        remaining_days = 3 - days_passed
-        if remaining_days > 0:
-            return True, remaining_days
-        return False, 0
-    except:
-        return True, 3
-
-def get_column_indices(headers):
-    indices = {
-        'Admin_ID': 0,
-        'Bot_Token': 1,
-        'Username': 2,
-        'Context': 3,
-        'Join_Date': 4,
-        'Status': 5,
-        'PlanToken': 6,
-        'Admin_Username': 7,
-        'Temp': 10
-    }
-    for key in indices.keys():
-        if key in headers:
-            indices[key] = headers.index(key)
-    return indices
-
-# --- DATA EXTRACTION SCRAPERS ---
-def fetch_text_from_url(url):
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            for tag in soup(['script', 'style', 'header', 'footer', 'nav', 'aside']):
-                tag.decompose()
-            text = soup.get_text(separator=' ', strip=True)
-            return text[:15000] 
+        join_date = datetime.strptime(join_date_str, "%Y-%m-%d")
+        current_date = datetime.now()
+        days_used = (current_date - join_date).days
+        if days_used <= 7:
+            return True, 7 - days_used
         else:
-            return f"Error: Status code {response.status_code}"
-    except Exception as e:
-        return f"Error connecting to website: {e}"
+            return False, 0
+    except:
+        return False, 0
 
-def extract_links_from_url(url):
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            links = []
-            base_url = urlparse(url).scheme + "://" + urlparse(url).netloc
-            for a_tag in soup.find_all('a', href=True):
-                href = a_tag['href']
-                full_url = urljoin(base_url, href)
-                if full_url.startswith("http") and full_url not in links:
-                    links.append(full_url)
-            return links[:15] 
-        return []
-    except Exception as e:
-        return []
-
-# --- SUB-BOT DYNAMIC ENGINE ---
-def get_groq_response(prompt, system_instruction):
-    global current_key_index, ai_client
-    for attempt in range(len(GROQ_API_KEYS)):
-        try:
-            chat_completion = ai_client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.3-70b-versatile",
-            )
-            return chat_completion.choices[0].message.content
-        except Exception as e:
-            print(f"Groq API Key index {current_key_index} failed: {e}. Rotating...")
-            current_key_index = (current_key_index + 1) % len(GROQ_API_KEYS)
-            ai_client = Groq(api_key=GROQ_API_KEYS[current_key_index])
-    return "⚠️ Server overload! Sabhi AI keys is waqt busy hain. Kripya thodi der baad dobara koshish karein."
-
-def run_client_bot_thread(token, system_instruction, join_date, status_str):
-    try:
-        client_bot = telebot.TeleBot(token)
-        active_client_instances[token] = client_bot
+def save_to_sheet(admin_id, bot_token, username, context_data):
+    global sheet
+    join_date = datetime.now().strftime("%Y-%m-%d")
+    
+    if not username.startswith('@'):
+        username = '@' + username
         
-        print(f"🤖 Sub-Bot [Token ending in ...{token[-6:]}] starting operations...")
+    if sheet is None:
+        print("Warning: Database connected nahi hai, data save nahi hoga.")
+        return join_date
         
-        @client_bot.message_handler(commands=['start'])
-        def start_msg(message):
-            plan_name, max_bots, max_chars, is_trial = parse_status(status_str)
-            welcome_text = (
-                f"👋 <b>Welcome! Main ek custom AI Assistant hoon.</b>\n\n"
-                f"Aap mujhse koi bhi swaal pooch sakte hain.\n\n"
-                f"📊 <b>Aapke Bot ka Plan:</b> {plan_name}\n"
-                f"✍️ <b>Response Character Limit:</b> {max_chars:,} chars."
-            )
-            client_bot.reply_to(message, welcome_text, parse_mode="HTML")
-
-        @client_bot.message_handler(func=lambda m: True)
-        def handle_query(message):
-            plan_name, max_bots, max_chars, is_trial = parse_status(status_str)
-            
-            if is_trial:
-                is_active, rem_days = check_trial_status(join_date)
-                if not is_active:
-                    client_bot.reply_to(message, "❌ <b>Free Trial Expired!</b>\nKripya Master bot par jaakar activation token se upgrade karein.")
-                    return
-            
-            loading_msg = client_bot.reply_to(message, "🤔 <i>Mera dimag soch raha hai...</i>", parse_mode="HTML")
-            
-            user_prompt = message.text
-            ai_response = get_groq_response(user_prompt, system_instruction)
-            
-            # Response constraint truncation
-            if len(ai_response) > max_chars:
-                ai_response = ai_response[:max_chars] + "\n\n(Plan character limit reached!)"
+    active_status = "Trial"
+    active_token = ""
+    try:
+        records = sheet.get_all_records()
+        for row in records:
+            if str(row.get('Admin_ID', '')).strip() == str(admin_id):
+                row_status = str(row.get('Status', 'Trial')).strip()
+                row_plan_token = str(row.get('PlanToken', '')).strip()
                 
-            try:
-                client_bot.edit_message_text(ai_response, message.chat.id, loading_msg.message_id, parse_mode="Markdown")
-            except:
-                client_bot.edit_message_text(ai_response, message.chat.id, loading_msg.message_id)
-
-        client_bot.polling(non_stop=True, timeout=20, long_polling_timeout=10)
+                if "premium" in row_status.lower() or "platinum" in row_status.lower() or "unlimited" in row_status.lower():
+                    active_status = row_status
+                    active_token = row_plan_token
+                elif "standard" in row_status.lower() and "premium" not in active_status.lower():
+                    active_status = row_status
+                    active_token = row_plan_token
+                elif "custom" in row_status.lower() and "premium" not in active_status.lower() and "standard" not in active_status.lower():
+                    active_status = row_status
+                    active_token = row_plan_token
     except Exception as e:
-        print(f"Exception in Client Bot Thread [Token ending in ...{token[-6:]}]: {e}")
+        print("Error checking status during bot save:", e)
 
-def start_client_bot(token, context, join_date, status):
-    # Agar pehle se chal raha hai, toh use stop karein
-    if token in active_client_instances:
+    context_str = str(context_data) if context_data else "No Context"
+    
+    # Matching column structure: [Admin_ID, Bot_Token, Username, Context, Join_Date, Status, PlanToken]
+    new_row = [str(admin_id), str(bot_token), str(username), context_str, join_date, active_status, active_token]
+    
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            print(f"Stopping already running bot: ...{token[-6:]}")
-            active_client_instances[token].stop_polling()
+            print(f"Database me data save kar raha hoon... (Attempt {attempt + 1}/{max_retries})")
+            sheet.append_row(new_row)
+            print("Data system database me safely save ho gaya!")
+            bot_tokens_cache[username.lower()] = bot_token
+            return join_date
         except Exception as e:
-            print(f"Error stopping dynamic bot: {e}")
+            print(f"Error saving to DB: {e}")
+            time.sleep(2) 
             
-    t = threading.Thread(target=run_client_bot_thread, args=(token, context, join_date, status))
+    print("Database connection failure after retries.")
+    return join_date
+
+def append_context_to_sheet(token, extra_context):
+    global sheet
+    if sheet is None:
+        return False
+    try:
+        records = sheet.get_all_records()
+        for i, row in enumerate(records):
+            if str(row.get('Bot_Token', '')).strip() == str(token).strip():
+                existing_context = str(row.get('Context', ''))
+                updated_context = existing_context + "\n\n--- Extra Data ---\n\n" + extra_context
+                
+                sheet.update_cell(i + 2, 4, updated_context)
+                return updated_context
+        return None
+    except Exception as e:
+        print(f"Error updating DB: {e}")
+        return False
+
+# --- RATE CARD DATA ---
+def get_plans_text():
+    return (
+        "🌟 <b>AI Bot SaaS Premium Plans & Rate Card</b> 🌟\n"
+        "--------------------------------------\n\n"
+        "⚡ <b>1. BASIC PLAN (FREE TRIAL)</b>\n"
+        "• <b>Price:</b> Free (For 7 Days)\n"
+        "• <b>Bot Limit:</b> Max 1 Bot\n"
+        "• <b>Data Limit:</b> Up to 15k Chars data\n\n"
+        "🚀 <b>2. STANDARD PLAN (STARTER PRO)</b>\n"
+        "• <b>Price:</b> ₹499 / Month\n"
+        "• <b>Bot Limit:</b> Max 3 Bots\n"
+        "• <b>Data Limit:</b> Up to 30k Chars data\n\n"
+        "👑 <b>3. UNLIMITED PLATINUM PLAN</b>\n"
+        "• <b>Price:</b> ₹999 / Month\n"
+        "• <b>Bot Limit:</b> Unlimited Bots 🔥\n"
+        "• <b>Data Limit:</b> Up to 50k Chars data\n\n"
+        "⚙️ <b>4. CUSTOM PLAN (High-Performance Pro)</b>\n"
+        "• <b>Price:</b> ₹1499+ / Month (Varies on requirements) 💎\n"
+        "• <b>Bot Limit:</b> Choose your own bot count limits\n"
+        "• <b>Data Limit:</b> Large Deep Crawling database (up to 100k+ Chars)\n"
+        "--------------------------------------\n"
+        "📌 <i>Status upgrade karne ke liye Activation Token enter karein ya niche contacts par DM karein!</i>"
+    )
+
+# --- AI CHAT FUNCTION ---
+def generate_groq_reply(context, user_message, retry=0):
+    if retry >= len(GROQ_API_KEYS):
+        return "Hamare system par abhi load zyada hai. Kripya thodi der baad try karein."
+        
+    try:
+        response = ai_client.chat.completions.create(
+            model="openai/gpt-oss-120b", 
+            messages=[
+                {"role": "system", "content": f"Aap ek company ke assistant bot hain. Sirf is context ke adhar par short aur sidha jawab dein: {context}. Markdown, star ya kisi bhi special symbol ka use bilkul na karein. Jab bahut zaroori ho tabhi thoda lamba jawab dein warna ek do line me baat khatam karein."},
+                {"role": "user", "content": user_message}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        error_str = str(e).lower()
+        if "rate limit" in error_str or "429" in error_str or "limit" in error_str:
+            print(f"Key limit Hit! Rotating...")
+            rotate_api_key()
+            return generate_groq_reply(context, user_message, retry + 1)
+        else:
+            print("Groq Error:", e)
+            return "Abhi main reply nahi kar pa raha hoon. Kripya baad me try karein."
+
+# --- CLIENT BOT ENGINE (Multi-Threading) ---
+def run_bot_polling(client_bot, token, join_date_str):
+    print(f"🚀 Client Bot Polling Thread Started (Token: {token[:10]}...)")
+    while True:
+        try:
+            client_bot.polling(non_stop=True, timeout=10, long_polling_timeout=5)
+        except Exception as e:
+            print(f"⚠️ Polling Exception in bot {token[:10]}...: {e}. Reconnecting in 5 seconds...")
+            time.sleep(5)
+
+def start_client_bot(token, context, join_date_str, status="Trial"):
+    bot_statuses[token] = status
+    
+    if token in bot_contexts:
+        bot_contexts[token] = context
+        print(f"Bot {token[:10]}... ka data memory me update ho gaya.")
+        return
+
+    bot_contexts[token] = context
+    client_bot = telebot.TeleBot(token)
+    
+    @client_bot.message_handler(func=lambda message: True)
+    def handle_customer_message(message):
+        current_status = bot_statuses.get(token, "Trial")
+        
+        plan_name, max_bots, max_chars, is_trial = parse_status(current_status)
+        if is_trial:
+            is_active, days_left = check_trial_status(join_date_str)
+            if not is_active:
+                expired_msg = (
+                    "❌ <b>Premium status active nahi hai!</b>\n\n"
+                    "Is bot ka 7-Day free trial samapt ho chuka hai aur iski services ko pause kar diya gaya hai.\n\n"
+                    f"📢 <b>SaaS Platform se Premium plan khareedne ke liye turant Developer ko DM karein:</b>\n"
+                    f"• <b>Telegram DM:</b> {DEVELOPER_TELEGRAM}\n"
+                    f"• <b>WhatsApp:</b> {ADMIN_PHONE}\n"
+                    f"• <b>Emails:</b> {ADMIN_EMAIL_1}, {ADMIN_EMAIL_2}\n\n"
+                    "<i>Apne AI assistant ko dobara active karne ke liye abhi contact karein!</i>"
+                )
+                client_bot.reply_to(message, expired_msg, parse_mode="HTML")
+                return
+            
+        if message.text:
+            if message.text.startswith('/'):
+                 return
+
+            client_bot.send_chat_action(message.chat.id, 'typing')
+            current_context = bot_contexts.get(token, "")
+            reply = generate_groq_reply(current_context, message.text)
+            client_bot.reply_to(message, reply)
+
+    t = threading.Thread(target=run_bot_polling, args=(client_bot, token, join_date_str))
     t.daemon = True
-    active_client_threads[token] = t
     t.start()
 
 # --- MASTER BOT LOGIC ---
 @master_bot.message_handler(commands=['start'])
-def master_start(message):
+def send_welcome(message):
     welcome_text = (
-        "🚀 <b>Master Control Bot me aapka swagat hai!</b>\n\n"
-        "Yahan se aap apne custom AI sub-bots ko build, start aur database status manage kar sakte hain.\n\n"
-        "📝 <b>Primary Commands:</b>\n"
-        "🔑 `/activate <token>` - Apne standard ya premium limits token ko redeem karein.\n"
-        "⚙️ `/setup_bot` - Naya bot token database me add aur register karne ke liye.\n"
-        "📊 `/status` - Aapke running plan aur dynamic limits ka report card.\n"
-        "🛠️ `/addmoredata` - Apne custom context prompt system ko update karein.\n"
-        "📞 `/contact` - Developer support se judne ke liye."
+        "👑 <b>Master AI Platform me aapka swagat hai!</b>\n\n"
+        "Commands:\n"
+        "/newbot - Naya AI Bot banayein\n"
+        "/mybots - Aapke bots aur settings dekhein\n"
+        "/activate - Code se premium plan activate karein\n"
+        "/status - Aapka current plan status dekhein\n"
+        "/plans - Price aur Plan Rate Card dekhein\n"
+        "/addmoredata - Bot mein aur data jodein\n"
+        "/contact - Developer aur support contact jankari\n"
+        "/help - System ki detailed jankari"
     )
     master_bot.reply_to(message, welcome_text, parse_mode="HTML")
-
-@master_bot.message_handler(commands=['contact'])
-def master_contact(message):
-    contact_text = (
-        "📞 <b>Contact Support & Developer Details:</b>\n\n"
-        f"👨‍💻 <b>Developer Telegram:</b> {DEVELOPER_TELEGRAM}\n"
-        f"📱 <b>Support Phone:</b> +91 {ADMIN_PHONE}\n"
-        f"📧 <b>Email 1:</b> {ADMIN_EMAIL_1}\n"
-        f"📧 <b>Email 2:</b> {ADMIN_EMAIL_2}\n\n"
-        "<i>Koi bhi error ya issue aane par aap upar diye gaye details par sampark kar sakte hain.</i>"
-    )
-    master_bot.reply_to(message, contact_text, parse_mode="HTML")
 
 @master_bot.message_handler(commands=['help'])
 def master_help(message):
     help_text = (
-        "❓ <b>Master Bot Help Guide:</b>\n\n"
-        "1️⃣ <b>Bot Setup:</b> `/setup_bot` command use karein aur @BotFather se mila naya token enter karein.\n"
-        "2️⃣ <b>Activation:</b> Agar aapke paas license token hai, to `/activate TOKEN_CODE` likhein (e.g. `/activate PREM-123456`). Isse aapka trial limit hat jayega aur naya plan lag jayega.\n"
-        "3️⃣ <b>Context Update:</b> Apne bot ka behavior change karne ke liye `/addmoredata` use karein aur naya prompt type karein.\n"
-        "4️⃣ <b>Status Check:</b> Apne sabhi connected bots ki detail dekhne ke liye `/status` enter karein."
+        "ℹ️ <b>Master Bot System Help Guide:</b>\n\n"
+        "<b>1. Bot Kaise Banayein (Step-by-Step):</b>\n"
+        "• Sabse pehle @BotFather par jayein aur <code>/newbot</code> command se apna naya bot banayein.\n"
+        "• BotFather se apna naya Bot Token copy karein.\n"
+        "• Hamare Master Bot me wapas aakar <code>/newbot</code> command type karein, aur naya Token yahan paste karein.\n"
+        "• Apne bot ka username (@ ke sath) type karein.\n"
+        "• Apne bot ko training dene ke liye URL ya TXT file upload karein.\n\n"
+        "<b>2. Premium Activation & Status:</b>\n"
+        "• Humare premium/custom plans active karne ke liye <code>/activate &lt;PlanToken&gt;</code> command ka use karein.\n"
+        "• Apne account ke active limits aur details ko check karne ke liye <code>/status</code> command bhejhein.\n\n"
+        "<b>3. Bot Settings Manage Kaise Karein:</b>\n"
+        "• Master bot me <code>/mybots</code> command bhejein.\n"
+        "• Aapke saare active bots ki list samne aayegi.\n"
+        "• Kisi bhi bot par click karke aap uski details settings open kar sakte hain.\n"
+        "• Settings panel se aap Bot ka <b>Name</b>, <b>Description</b>, aur <b>Training Data</b> directly update kar sakte hain bina bot ko restart kiye!\n\n"
+        "<b>4. Group ya Private me AI Kaise use karein:</b>\n"
+        "• <b>Private:</b> Customers direct bot ko /start bhej kar baat kar sakte hain.\n"
+        "• <b>Groups:</b> Apne bot ko group me add karein aur use Admin permissions dein.\n\n"
+        f"📞 Support support ke liye <code>/contact</code> command ka use karein."
     )
     master_bot.reply_to(message, help_text, parse_mode="HTML")
 
+@master_bot.message_handler(commands=['contact'])
+def master_contact(message):
+    contact_text = (
+        "📞 <b>Support & Developer Contact details:</b>\n"
+        "--------------------------------------\n\n"
+        f"• <b>Telegram DM:</b> {DEVELOPER_TELEGRAM}\n"
+        f"• <b>WhatsApp Support:</b> {ADMIN_PHONE}\n"
+        f"• <b>Support Email 1:</b> {ADMIN_EMAIL_1}\n"
+        f"• <b>Support Email 2:</b> {ADMIN_EMAIL_2}\n\n"
+        "Premium status upgrade karwane, rate list badalne ya kisi technical query ke liye hume kabhi bhi contact karein."
+    )
+    master_bot.reply_to(message, contact_text, parse_mode="HTML")
+
+@master_bot.message_handler(commands=['plans'])
+def list_plans(message):
+    plans_msg = get_plans_text()
+    master_bot.reply_to(message, plans_msg, parse_mode="HTML")
+
 @master_bot.message_handler(commands=['status'])
-def master_status_check(message):
-    user_id = str(message.chat.id)
-    master_bot.reply_to(message, "🔍 Database me aapka account plan search kar raha hoon...")
+def check_user_status(message):
+    chat_id = message.chat.id
+    plan_name, max_bots, max_chars, is_trial, user_bots_count = get_user_limits(chat_id)
     
-    if sheet is None:
-        master_bot.reply_to(message, "❌ Database offline hai.")
-        return
-        
-    try:
-        records = sheet.get_all_records()
-        user_bots = [r for r in records if str(r.get('Admin_ID', '')).strip() == user_id]
-        
-        if not user_bots:
-            master_bot.reply_to(message, "📝 Aapka koi active bot register nahi mila. Free Setup ke liye `/setup_bot` use karein!")
-            return
-            
-        report_msg = "📊 <b>Aapke Registered Platform Bots:</b>\n\n"
-        for idx, bot in enumerate(user_bots, 1):
-            status = bot.get('Status', 'Trial')
-            plan_name, max_bots, max_chars, is_trial = parse_status(status)
-            
-            report_msg += f"🤖 <b>Bot {idx}:</b> @{bot.get('Username', 'No_Username')}\n"
-            report_msg += f"• Plan Type: <b>{plan_name}</b>\n"
-            report_msg += f"• Max Chars allowed: {max_chars:,}\n"
-            
-            if is_trial:
-                is_active, rem_days = check_trial_status(str(bot.get('Join_Date', '')))
-                status_text = f"Active Free Trial ({rem_days} din bache hain)" if is_active else "Free Trial Expired ❌"
-                report_msg += f"• Activation Status: {status_text}\n\n"
-            else:
-                report_msg += f"• Activation Status: Active Premium ✅\n\n"
-                
-        master_bot.reply_to(message, report_msg, parse_mode="HTML")
-    except Exception as e:
-        master_bot.reply_to(message, f"❌ Plan data compile failed: {e}")
+    status_text = (
+        "📊 <b>Aapka Account Status & Limits:</b>\n"
+        "--------------------------------------\n"
+        f"• <b>Current Plan:</b> {plan_name}\n"
+        f"• <b>Total Bots Allowed:</b> {max_bots if max_bots < 999 else 'Unlimited 🔥'}\n"
+        f"• <b>Active Bots Count:</b> {user_bots_count}\n"
+        f"• <b>Remaining Bots Slot:</b> {max(0, max_bots - user_bots_count) if max_bots < 999 else 'Unlimited 🔥'}\n"
+        f"• <b>Data Training Limit:</b> {max_chars:,} Characters\n"
+        "--------------------------------------\n\n"
+        "💡 <i>Naya plan activate karne ke liye use karein:</i>\n"
+        "<code>/activate &lt;PlanToken&gt;</code>"
+    )
+    master_bot.reply_to(message, status_text, parse_mode="HTML")
 
 @master_bot.message_handler(commands=['activate'])
-def master_activate_token(message):
+def activate_plan_command(message):
+    chat_id = message.chat.id
     text_parts = message.text.strip().split()
     if len(text_parts) < 2:
-        master_bot.reply_to(message, "⚠️ Format galat hai! Kripya command aise likhein:\n`/activate PREM-XXXXXX`", parse_mode="HTML")
+        master_bot.reply_to(message, "⚠️ Format sahi nahi hai! Kripya aise activate karein:\n<code>/activate &lt;Your_Token_Here&gt;</code>", parse_mode="HTML")
         return
         
-    activation_token = text_parts[1].strip()
-    user_id = str(message.chat.id)
-    user_name = "@" + str(message.from_user.username) if message.from_user.username else "No_Username"
+    token = text_parts[1].strip()
+    master_bot.reply_to(message, "⏳ Activation Token verify kar raha hoon, kripya pratiksha karein...")
     
-    master_bot.reply_to(message, "⏳ Activation process verify kiya ja raha hai...")
-    
+    plan_info, error = activate_token_in_db(chat_id, token)
+    if error:
+        master_bot.reply_to(message, f"❌ {error}")
+    else:
+        success_msg = (
+            "🎉 <b>Success! Aapka Plan Activate/Update Ho Gaya Hai!</b>\n"
+            "--------------------------------------\n"
+            f"• <b>New Plan:</b> {plan_info['plan_name']}\n"
+            f"• <b>Bot Limit:</b> {plan_info['max_bots'] if plan_info['max_bots'] < 999 else 'Unlimited 🔥'}\n"
+            f"• <b>Training Chars Limit:</b> {plan_info['max_chars']:,} Characters\n"
+            "--------------------------------------\n\n"
+            "💡 Aapke existing sabhi bots par naya plan lagoo kar diya gaya hai. /status se limits check karein!"
+        )
+        master_bot.reply_to(message, success_msg, parse_mode="HTML")
+
+@master_bot.message_handler(commands=['mybots'])
+def list_my_bots(message):
+    chat_id = str(message.chat.id)
     if sheet is None:
-        master_bot.reply_to(message, "❌ Database offline hai. Kripya thodi der baad koshish karein.")
+        master_bot.reply_to(message, "Error: System Database connected nahi hai.")
         return
         
     try:
         records = sheet.get_all_records()
-        headers = sheet.row_values(1)
-        indices = get_column_indices(headers)
+        user_bots = [row for row in records if str(row.get('Admin_ID', '')).strip() == chat_id]
         
-        # 1. Find unused token row from DB
-        token_row_num = None
-        plan_type = None
+        active_user_bots = [r for r in user_bots if str(r.get('Bot_Token', '')).strip()]
         
-        for idx, row in enumerate(records, 2):  # row 2 is index 0 of records
-            row_token = str(row.get('PlanToken', '')).strip()
-            row_admin = str(row.get('Admin_ID', '')).strip()
-            
-            if row_token == activation_token:
-                if row_admin and row_admin.isdigit():
-                    master_bot.reply_to(message, "❌ <b>Security Error!</b> Ye token pehle hi kisi aur user ke sath activated hai.")
-                    return
-                token_row_num = idx
-                plan_type = str(row.get('Temp', 'Standard')).strip()
-                break
-                
-        if not token_row_num:
-            master_bot.reply_to(message, "❌ <b>Galat Token!</b> Kripya sahi token copy karke type karein.")
+        if not active_user_bots:
+            master_bot.reply_to(message, "Aapne abhi tak koi bot add nahi kiya hai. Naya bot banane ke liye /newbot use karein.")
             return
+            
+        markup = telebot.types.InlineKeyboardMarkup()
+        for row in active_user_bots:
+            username = row.get('Username', 'Unknown Bot')
+            markup.add(telebot.types.InlineKeyboardButton(text=f"🤖 {username}", callback_data=f"bot_{username}"))
+            
+        master_bot.reply_to(message, "📋 <b>Aapke Registered Bots:</b>\nKisi bhi bot par click karke uski settings manage karein:", reply_markup=markup, parse_mode="HTML")
+    except Exception as e:
+        print("Error in /mybots:", e)
+        master_bot.reply_to(message, "Error: Bots list load nahi ho payi.")
 
-        # 2. Find if User already has an existing row
-        user_row_num = None
-        for idx, row in enumerate(records, 2):
-            if str(row.get('Admin_ID', '')).strip() == user_id and idx != token_row_num:
-                user_row_num = idx
-                break
+# --- CALLBACK QUERY HANDLER FOR SETTINGS ---
+@master_bot.callback_query_handler(func=lambda call: True)
+def handle_bot_settings(call):
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    data = call.data
+    
+    if data == "back_to_list":
+        try:
+            records = sheet.get_all_records()
+            user_bots = [row for row in records if str(row.get('Admin_ID', '')).strip() == str(chat_id)]
+            active_user_bots = [r for r in user_bots if str(r.get('Bot_Token', '')).strip()]
+            markup = telebot.types.InlineKeyboardMarkup()
+            for row in active_user_bots:
+                username = row.get('Username', 'Unknown Bot')
+                markup.add(telebot.types.InlineKeyboardButton(text=f"🤖 {username}", callback_data=f"bot_{username}"))
+            master_bot.edit_message_text("📋 <b>Aapke Registered Bots:</b>\nSettings manage karne ke liye bot chunein:", chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+        except:
+            master_bot.answer_callback_query(call.id, "Error loading list.")
+        return
 
-        print(f"Master Bot: Applying new plan '{plan_type}' for Admin ID {user_id}...")
-
-        if user_row_num:
-            # User already exists! Replace their old plan with the new token details
-            print(f"Master Bot: Existing user found at row {user_row_num}. Updating plan directly...")
-            sheet.update_cell(user_row_num, indices['Status'] + 1, plan_type)
-            sheet.update_cell(user_row_num, indices['PlanToken'] + 1, activation_token)
-            sheet.update_cell(user_row_num, indices['Join_Date'] + 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            sheet.update_cell(user_row_num, indices['Admin_Username'] + 1, user_name)
-            
-            # Now delete the unused blank token row to prevent duplicates
-            print(f"Master Bot: Deleting consumed token row {token_row_num}...")
-            sheet.delete_rows(token_row_num)
-            
-            # Adjust row index if token row was located above the user row
-            if token_row_num < user_row_num:
-                user_row_num -= 1
-                
-            active_row = user_row_num
-        else:
-            # New User! Activate the token row with user credentials
-            print(f"Master Bot: New user. Activating token row {token_row_num}...")
-            sheet.update_cell(token_row_num, indices['Admin_ID'] + 1, user_id)
-            sheet.update_cell(token_row_num, indices['Join_Date'] + 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            sheet.update_cell(token_row_num, indices['Status'] + 1, plan_type)
-            sheet.update_cell(token_row_num, indices['Admin_Username'] + 1, user_name)
-            
-            active_row = token_row_num
-            
-        # Extract the updated configuration details to restart the sub-bot smoothly
-        updated_row_data = sheet.row_values(active_row)
-        bot_token_col = indices['Bot_Token']
-        assigned_bot_token = str(updated_row_data[bot_token_col]).strip() if len(updated_row_data) > bot_token_col else ""
+    if data.startswith("bot_"):
+        bot_username = data.replace("bot_", "")
         
-        plan_name, max_bots, max_chars, is_trial = parse_status(plan_type)
-        
-        success_msg = (
-            f"🎉 <b>Plan Successfully Activated!</b>\n"
-            f"--------------------------------------\n"
-            f"• <b>Upgrade Plan:</b> {plan_name}\n"
-            f"• <b>Response Length Limit:</b> {max_chars:,} chars\n\n"
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.row(
+            telebot.types.InlineKeyboardButton("🏷️ Name Change", callback_data=f"editname_{bot_username}"),
+            telebot.types.InlineKeyboardButton("📝 Desc Change", callback_data=f"editdesc_{bot_username}")
+        )
+        markup.row(
+            telebot.types.InlineKeyboardButton("📥 Add More Data", callback_data=f"adddata_{bot_username}"),
+            telebot.types.InlineKeyboardButton("🔙 Back to List", callback_data="back_to_list")
         )
         
-        if assigned_bot_token and len(assigned_bot_token) > 10:
-            success_msg += f"🟢 Aapka dynamic bot @{updated_row_data[indices['Username']]} naye plan ke sath successfully update ho gaya hai!"
-            start_client_bot(assigned_bot_token, updated_row_data[indices['Context']], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), plan_type)
-        else:
-            success_msg += "👉 <b>Next Step:</b> Naya Bot register karne ke liye niche likhi command type karein:\n`/setup_bot`"
-            
-        master_bot.reply_to(message, success_msg, parse_mode="HTML")
-    except Exception as e:
-        master_bot.reply_to(message, f"❌ Activation transaction failed: {e}")
+        settings_text = (
+            f"🛠️ <b>Bot Control Panel</b>\n\n"
+            f"• <b>Bot Username:</b> {bot_username}\n"
+            "• Niche diye gaye options se aap is bot ke details live change kar sakte hain."
+        )
+        master_bot.edit_message_text(settings_text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+        return
 
-@master_bot.message_handler(commands=['setup_bot'])
-def master_setup_bot_start(message):
-    user_id = str(message.chat.id)
-    admin_states[user_id] = {'step': 'wait_for_token'}
-    prompt = (
-        "🤖 <b>Bot Setup Wizard:</b>\n\n"
-        "Kripya aapke Bot ka token enter karein jo aapne @BotFather se create kiya hai."
-    )
-    master_bot.reply_to(message, prompt)
+    action, target_username = data.split("_", 1)
+    
+    target_token = bot_tokens_cache.get(target_username.lower())
+    if not target_token and sheet is not None:
+        try:
+            records = sheet.get_all_records()
+            for row in records:
+                if str(row.get('Username', '')).strip().lower() == target_username.lower():
+                    target_token = str(row.get('Bot_Token', '')).strip()
+                    bot_tokens_cache[target_username.lower()] = target_token
+                    break
+        except Exception as e:
+            print("Token cache lookup failed:", e)
+
+    if not target_token:
+        master_bot.answer_callback_query(call.id, "Error: Token nahi mila.")
+        return
+
+    if action == "editname":
+        admin_states[chat_id] = {'step': 'wait_for_botname', 'token': target_token, 'username': target_username}
+        master_bot.send_message(chat_id, f"📝 <b>{target_username}</b> ke liye naya Name type karke bhejein:")
+        master_bot.answer_callback_query(call.id)
+        
+    elif action == "editdesc":
+        admin_states[chat_id] = {'step': 'wait_for_botdesc', 'token': target_token, 'username': target_username}
+        master_bot.send_message(chat_id, f"📝 <b>{target_username}</b> ke liye naya Description text type karke bhejein:")
+        master_bot.answer_callback_query(call.id)
+        
+    elif action == "adddata":
+        plan_name, max_bots, max_chars, is_trial, user_bots_count = get_user_limits(chat_id)
+        admin_states[chat_id] = {'step': 'add_data_type', 'token': target_token, 'username': target_username, 'max_chars': max_chars}
+        master_bot.send_message(chat_id, f"📥 <b>{target_username}</b> me data kaise dena hai? Type karein <code>URL</code> ya <code>TXT</code>.", parse_mode="HTML")
+        master_bot.answer_callback_query(call.id)
+
+@master_bot.message_handler(commands=['newbot'])
+def ask_token(message):
+    chat_id = str(message.chat.id)
+    plan_name, max_bots, max_chars, is_trial, user_bots_count = get_user_limits(chat_id)
+            
+    if user_bots_count >= max_bots:
+        block_msg = (
+            f"❌ <b>Aapki plan limit ({max_bots} bot) poori ho chuki hai!</b>\n"
+            f"Current Plan: <b>{plan_name}</b>\n\n"
+            "Ek se zyada bot add karne ke liye aapko <b>Premium ya Custom Plan</b> lena hoga.\n\n"
+            "🌟 <b>Premium/Custom active karne ke liye humse sampark (DM) karein:</b>\n"
+            f"• <b>Telegram DM:</b> {DEVELOPER_TELEGRAM}\n"
+            f"• <b>WhatsApp:</b> {ADMIN_PHONE}\n"
+            f"• <b>Emails:</b> {ADMIN_EMAIL_1}, {ADMIN_EMAIL_2}\n\n"
+            "<i>Agar aapke paas valid activation token hai, toh code use karein: <code>/activate &lt;PlanToken&gt;</code></i>"
+        )
+        master_bot.reply_to(message, block_msg, parse_mode="HTML")
+        return
+            
+    admin_states[int(chat_id)] = {'step': 'token', 'max_chars': max_chars}
+    master_bot.reply_to(message, "1. Apna Bot Token bhejein:")
 
 @master_bot.message_handler(commands=['addmoredata'])
-def master_add_more_data(message):
-    user_id = str(message.chat.id)
-    admin_states[user_id] = {'step': 'wait_for_context'}
-    prompt = (
-        "🛠️ <b>Context Jodne Ke Liye Wizard:</b>\n\n"
-        "Apne bot ke liye naya prompt/rules instructions likh kar bhejein (jaise: <i>You are a coding expert named Yadav AI</i>).\n"
-        "Aap URL likh kar bhi bhej sakte hain (jaise `add_url:https://google.com`), jise fetch kiya jayega."
-    )
-    master_bot.reply_to(message, prompt, parse_mode="HTML")
+def add_more_data(message):
+    chat_id = message.chat.id
+    admin_states[chat_id] = {'step': 'wait_for_username'}
+    master_bot.reply_to(message, "📝 Apna wo <b>Bot Username</b> (e.g. @MyBot) bhejein jisme naya data jodna hai:")
 
-# --- TEXT STEPS FOR SETUP BOT HANDLER ---
-@master_bot.message_handler(func=lambda m: str(m.chat.id) in admin_states)
-def handle_master_steps(message):
-    user_id = str(message.chat.id)
-    step = admin_states[user_id].get('step')
+@master_bot.message_handler(content_types=['document'])
+def handle_txt_file(message):
+    chat_id = message.chat.id
+    if chat_id in admin_states:
+        step = admin_states[chat_id].get('step')
+        max_chars = admin_states[chat_id].get('max_chars', 15000)
+        
+        if step in ['context_data', 'add_data_txt']:
+            if message.document.file_name.endswith('.txt'):
+                master_bot.reply_to(message, "Document process kar raha hoon...")
+                file_info = master_bot.get_file(message.document.file_id)
+                downloaded_file = master_bot.download_file(file_info.file_path)
+                context_text = downloaded_file.decode('utf-8')[:max_chars] 
+                
+                if step == 'context_data':
+                    finalize_registration(message, chat_id, context_text)
+                else:
+                    finalize_add_data(message, chat_id, context_text)
+            else:
+                master_bot.reply_to(message, "Kripya sirf .txt file hi upload karein.")
+
+@master_bot.message_handler(func=lambda message: True)
+def handle_text_steps(message):
+    chat_id = message.chat.id
     text = message.text.strip()
     
-    if step == 'wait_for_token':
-        # Verify if token is a valid Telegram Bot Token format
-        if ":" not in text or len(text) < 30:
-            master_bot.reply_to(message, "❌ Invalid Bot Token format! BotFather se mila token sahi se copy karke send karein.")
-            return
-            
-        admin_states[user_id]['bot_token'] = text
-        master_bot.reply_to(message, "⏳ Bot API key test ki ja rahi hai...")
-        
-        try:
-            # Test token request
-            test_res = requests.get(f"https://api.telegram.org/bot{text}/getMe", timeout=10).json()
-            if not test_res.get('ok'):
-                master_bot.reply_to(message, "❌ **API Error!** Bot key valid nahi hai ya delete ho chuki hai.")
-                return
-                
-            bot_username = test_res['result']['username']
-            admin_states[user_id]['bot_username'] = bot_username
-            admin_states[user_id]['step'] = 'wait_for_system_context'
-            
-            master_bot.reply_to(message, f"🎯 **Bot Found:** @{bot_username}\n\n👉 Ab aap is bot ka System prompt/Context write karein (Rules or dynamic personality):")
-        except:
-            master_bot.reply_to(message, "❌ Connection Timeout! API validation check skip ho gayi. Kripya firse koshish karein.")
-            
-    elif step == 'wait_for_system_context':
-        bot_token = admin_states[user_id]['bot_token']
-        bot_username = admin_states[user_id]['bot_username']
-        system_context = text
-        
-        master_bot.reply_to(message, "⏳ Details database me sync ki ja rahi hain...")
-        
-        if sheet is None:
-            master_bot.reply_to(message, "❌ Connection Error. Database offline hai.")
-            return
-            
-        try:
-            records = sheet.get_all_records()
-            headers = sheet.row_values(1)
-            indices = get_column_indices(headers)
-            
-            # Find the row of active activated plan
-            target_row_num = None
-            join_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            current_status = "Trial"
-            
-            for idx, r in enumerate(records, 2):
-                if str(r.get('Admin_ID', '')).strip() == user_id:
-                    target_row_num = idx
-                    current_status = r.get('Status', 'Trial')
-                    join_date = r.get('Join_Date', join_date)
-                    break
-                    
-            # If no plan exists, we write a trial record
-            if not target_row_num:
-                new_row = [""] * len(headers)
-                new_row[indices['Admin_ID']] = user_id
-                new_row[indices['Bot_Token']] = bot_token
-                new_row[indices['Username']] = bot_username
-                new_row[indices['Context']] = system_context
-                new_row[indices['Join_Date']] = join_date
-                new_row[indices['Status']] = "Trial"
-                new_row[indices['Admin_Username']] = "@" + message.from_user.username if message.from_user.username else "No_Username"
-                sheet.append_row(new_row)
-            else:
-                # Update cells
-                sheet.update_cell(target_row_num, indices['Bot_Token'] + 1, bot_token)
-                sheet.update_cell(target_row_num, indices['Username'] + 1, bot_username)
-                sheet.update_cell(target_row_num, indices['Context'] + 1, system_context)
-                
-            # Dynamic engine run command
-            start_client_bot(bot_token, system_context, join_date, current_status)
-            
-            master_bot.reply_to(message, f"🎉 <b>Bot Successfully Registered & Live!</b>\n\n👉 Click here to test: @{bot_username}", parse_mode="HTML")
-            del admin_states[user_id]
-        except Exception as e:
-            master_bot.reply_to(message, f"❌ Database sync operation failed: {e}")
-            
-    elif step == 'wait_for_context':
-        context_data = text
-        if text.startswith("add_url:"):
-            url = text.replace("add_url:", "").strip()
-            master_bot.reply_to(message, f"⏳ Bhej gaye URL se data extract kar raha hoon:\n{url}")
-            extracted_text = fetch_text_from_url(url)
-            if "Error" not in extracted_text:
-                context_data = f"Extracted info from {url}:\n{extracted_text}"
-            else:
-                master_bot.reply_to(message, f"⚠️ Scraping Warning: {extracted_text}")
-                context_data = text
+    if chat_id not in admin_states:
+        return
 
-        master_bot.reply_to(message, "⏳ Context data database me update kiya ja raha hai...")
-        
-        if sheet is None:
-            master_bot.reply_to(message, "❌ Connection Error.")
-            return
-            
-        try:
-            records = sheet.get_all_records()
-            headers = sheet.row_values(1)
-            indices = get_column_indices(headers)
-            
-            target_row = None
-            for idx, r in enumerate(records, 2):
-                if str(r.get('Admin_ID', '')).strip() == user_id:
-                    target_row = idx
-                    break
-                    
-            if not target_row:
-                master_bot.reply_to(message, "❌ Database me aapka setup incomplete mila. Kripya pehle `/setup_bot` complete karein.")
-                return
-                
-            # Keep previous context and append new one
-            previous_context = str(sheet.cell(target_row, indices['Context'] + 1).value or "")
-            new_full_context = previous_context + "\n\n" + context_data if previous_context else context_data
-                
-            sheet.update_cell(target_row, indices['Context'] + 1, new_full_context[:45000]) # Cap to avoid Google Sheet Limits
-            
-            updated_row = sheet.row_values(target_row)
-            bot_token = updated_row[indices['Bot_Token']]
-            join_date = updated_row[indices['Join_Date']]
-            current_status = updated_row[indices['Status']]
-            
-            # Restart Bot with new Context instructions
-            start_client_bot(bot_token, new_full_context, join_date, current_status)
-            
-            master_bot.reply_to(message, "✅ <b>Success! Context prompt updated and Bot restarted safely!</b>", parse_mode="HTML")
-            del admin_states[user_id]
-        except Exception as e:
-            master_bot.reply_to(message, f"❌ Context update failed: {e}")
+    step = admin_states[chat_id].get('step')
+    max_chars = admin_states[chat_id].get('max_chars', 15000)
 
-# --- SYSTEM INITIALIZATION & POLLING ---
-def run_master_polling():
-    print("Master Bot System is booting up...")
-    apihelper.CONNECT_TIMEOUT = 30
-    apihelper.READ_TIMEOUT = 30
+    if step == 'token':
+        admin_states[chat_id]['token'] = text
+        admin_states[chat_id]['step'] = 'username'
+        master_bot.reply_to(message, "2. Apne bot ka Username bhejein (jaise @MyBot):")
+        
+    elif step == 'username':
+        if not text.startswith('@'):
+            text = '@' + text
+        admin_states[chat_id]['username'] = text
+        admin_states[chat_id]['step'] = 'context_type'
+        master_bot.reply_to(message, "3. Data kaise dena hai? URL ya TXT likhein.")
+        
+    elif step == 'context_type':
+        if text.upper() == 'URL':
+            admin_states[chat_id]['step'] = 'url'
+            master_bot.reply_to(message, "Apni website ka URL bhejein (isme thoda time lag sakta hai):")
+        elif text.upper() == 'TXT':
+            admin_states[chat_id]['step'] = 'context_data'
+            master_bot.reply_to(message, "Ab apni .txt file upload karein.")
+        else:
+            master_bot.reply_to(message, "Sirf URL ya TXT type karein.")
+            
+    elif step == 'url':
+        master_bot.reply_to(message, "Website aur uske links se data nikal raha hoon, thoda intezaar karein...")
+        context_text = extract_text_from_url(text, max_chars=max_chars)
+        if context_text:
+            finalize_registration(message, chat_id, context_text)
+        else:
+            master_bot.reply_to(message, "URL se text nahi mila. Sahi URL dein ya TXT chunein.")
+
+    elif step == 'wait_for_username':
+        username_query = text.lower()
+        if not username_query.startswith('@'):
+            username_query = '@' + username_query
+            
+        target_token = None
+        user_max_chars = 15000
+        if sheet is not None:
+            try:
+                records = sheet.get_all_records()
+                for row in records:
+                    if str(row.get('Username', '')).strip().lower() == username_query:
+                        target_token = str(row.get('Bot_Token', '')).strip()
+                        user_rows = [r for r in records if str(r.get('Admin_ID', '')).strip() == str(chat_id)]
+                        for r in user_rows:
+                            p_name, m_bots, m_chars, t_trial = parse_status(r.get('Status', 'Trial'))
+                            if m_chars > user_max_chars:
+                                user_max_chars = m_chars
+                        break
+            except Exception as e:
+                print("Username query DB error:", e)
+                
+        if target_token:
+            admin_states[chat_id] = {'step': 'add_data_type', 'token': target_token, 'username': username_query, 'max_chars': user_max_chars}
+            master_bot.reply_to(message, f"✅ Bot mil gaya!\nNaya data kaise dena hai? URL ya TXT type karein.")
+        else:
+            master_bot.reply_to(message, "❌ Bot username data system me nahi mila. Kripya correct username type karein.")
+            del admin_states[chat_id]
+
+    elif step == 'add_data_type':
+        if text.upper() == 'URL':
+            admin_states[chat_id]['step'] = 'add_data_url'
+            master_bot.reply_to(message, "Naya URL bhejein:")
+        elif text.upper() == 'TXT':
+            admin_states[chat_id]['step'] = 'add_data_txt'
+            master_bot.reply_to(message, "Nayi .txt file upload karein.")
+        else:
+            master_bot.reply_to(message, "Sirf URL ya TXT type karein.")
+            
+    elif step == 'add_data_url':
+        master_bot.reply_to(message, "Website aur links se naya data nikal raha hoon, intezaar karein...")
+        extra_context = extract_text_from_url(text, max_chars=max_chars)
+        if extra_context:
+            finalize_add_data(message, chat_id, extra_context)
+        else:
+            master_bot.reply_to(message, "URL fail ho gaya. Sahi URL dein.")
+
+    elif step == 'wait_for_botname':
+        token = admin_states[chat_id]['token']
+        username = admin_states[chat_id]['username']
+        master_bot.reply_to(message, "⏳ Live update process kar raha hoon...")
+        try:
+            temp_bot = telebot.TeleBot(token)
+            temp_bot.set_my_name(name=text)
+            master_bot.reply_to(message, f"✅ Success! <b>{username}</b> ka name live change hokar <b>{text}</b> ho gaya hai.", parse_mode="HTML")
+        except Exception as e:
+            master_bot.reply_to(message, f"⚠️ Error name update karne me: {e}")
+        del admin_states[chat_id]
+
+    elif step == 'wait_for_botdesc':
+        token = admin_states[chat_id]['token']
+        username = admin_states[chat_id]['username']
+        master_bot.reply_to(message, "⏳ Live update process kar raha hoon...")
+        try:
+            temp_bot = telebot.TeleBot(token)
+            temp_bot.set_my_description(description=text)
+            master_bot.reply_to(message, f"✅ Success! <b>{username}</b> ka description live update ho gaya hai.", parse_mode="HTML")
+        except Exception as e:
+            master_bot.reply_to(message, f"⚠️ Error description update karne me: {e}")
+        del admin_states[chat_id]
+
+def finalize_registration(message, chat_id, context_text):
+    data = admin_states[chat_id]
+    join_date = save_to_sheet(str(chat_id), data['token'], data['username'], context_text)
     
-    try:
-        print("Telegram Commands set karne ki koshish kar raha hoon...")
-        master_bot.set_my_commands([
-            telebot.types.BotCommand("/start", "Main menu"),
-            telebot.types.BotCommand("/setup_bot", "Naya bot configure karein"),
-            telebot.types.BotCommand("/activate", "Apna Premium/Standard token lagayein"),
-            telebot.types.BotCommand("/status", "Apne bot aur limits check karein"),
-            telebot.types.BotCommand("/addmoredata", "Purane bot me data/URL jodein"),
-            telebot.types.BotCommand("/contact", "Developer & Support details"),
-            telebot.types.BotCommand("/help", "Detailed help guide")
-        ])
-        print("Telegram Commands successfully set!")
-    except Exception as e:
-        print(f"⚠️ Warning: Connection issue while setting commands: {e}")
+    start_client_bot(data['token'], context_text, join_date, "Trial")
+    
+    del admin_states[chat_id]
+    
+    success_text = f"Badhaai ho! Aapka bot ({data['username']}) shuru ho gaya hai.\nTrial: 7 din ka free trial aaj ({join_date}) se chalu hai.\n\nIse private chat me ya group me admin banakar test karein."
+    master_bot.reply_to(message, success_text)
 
-    # Load and run all already existing user sub-bots on startup
+def finalize_add_data(message, chat_id, extra_context):
+    token = admin_states[chat_id]['token']
+    master_bot.reply_to(message, "Database mein data update kar raha hoon...")
+    
+    updated_context = append_context_to_sheet(token, extra_context)
+    
+    if updated_context:
+        if token in bot_contexts:
+            bot_contexts[token] = updated_context
+        master_bot.reply_to(message, "Success! Naya data bot mein add ho gaya hai.")
+    elif updated_context is None:
+        master_bot.reply_to(message, "Error: Ye Bot database me nahi mila.")
+    else:
+        master_bot.reply_to(message, "Error: Database update me problem aayi.")
+        
+    del admin_states[chat_id]
+
+def run_bot():
+    print("Master System Booting up...")
+    master_bot.set_my_commands([
+        telebot.types.BotCommand("/start", "Main menu"),
+        telebot.types.BotCommand("/newbot", "Naya AI Bot banayein"),
+        telebot.types.BotCommand("/mybots", "Aapke bots ki list"),
+        telebot.types.BotCommand("/activate", "Premium code activate karein"),
+        telebot.types.BotCommand("/status", "Current plan limits status"),
+        telebot.types.BotCommand("/plans", "Plans aur Price details"),
+        telebot.types.BotCommand("/addmoredata", "Purane bot me data jodein"),
+        telebot.types.BotCommand("/contact", "Developer & Support details"),
+        telebot.types.BotCommand("/help", "Detailed help guide")
+    ])
+    
     if sheet is not None:
         try:
-            records = sheet.get_all_records()
-            print(f"Total {len(records)} clients found in sheet DB.")
-            for row in records:
+            all_records = sheet.get_all_records()
+            print(f"Total {len(all_records)} clients found in DB.")
+            for row in all_records:
                 status = str(row.get('Status', '')).strip()
                 token = str(row.get('Bot_Token', '')).strip()
                 username = str(row.get('Username', '')).strip()
                 join_date = str(row.get('Join_Date', '')).strip()
-                context = str(row.get('Context', '')).strip()
                 
                 if username and token:
                     bot_tokens_cache[username.lower()] = token
@@ -671,20 +906,20 @@ def run_master_polling():
                 is_active = True
                 if is_trial and join_date:
                     is_active, _ = check_trial_status(join_date)
-                    
-                if is_active and token and len(token) > 10:
-                    start_client_bot(token, context, join_date, status)
+                
+                if is_active and token:
+                    start_client_bot(token, row.get('Context', ''), join_date, status)
         except Exception as e:
-            print("Purane bots load nahi ho paye: ", e)
+            print("Purane bots load nahi ho paye.", e)
     else:
-        print("Database connect na hone ke karan historical clients offline hain.")
+        print("Database connect na hone ke karan purane bots load nahi hue.")
 
-    # Main master polling with reconnection guard loop
+    print("Master Bot is ready for registrations!")
     while True:
         try:
             master_bot.polling(non_stop=True, timeout=20, long_polling_timeout=10)
         except Exception as e:
-            print(f"⚠️ Polling Exception in Master Bot: {e}. Reconnecting in 5 seconds...")
+            print(f"Polling Exception in Master Bot: {e}. Reconnecting in 5 seconds...")
             time.sleep(5)
 
 # --- FLASK SERVER SETUP FOR RENDER HEALTH CHECKS ---
@@ -692,19 +927,19 @@ flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def home():
-    return "Master & Sub-bots running 24/7 dynamically on Render!"
+    return "Master AI Platform is running 24/7 on Render!"
 
 @flask_app.route('/health')
 def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    # Start bot operations in background thread
-    bot_thread = threading.Thread(target=run_master_polling)
+    # Start bot in a background thread
+    bot_thread = threading.Thread(target=run_bot)
     bot_thread.daemon = True
     bot_thread.start()
     
-    # Run Flask Web Server according to Render Port requirement
+    # Start Flask web server for Render on the main thread
     port = int(os.environ.get("PORT", 8080))
     print(f"Flask Web Server started on port {port}...")
     flask_app.run(host="0.0.0.0", port=port)
