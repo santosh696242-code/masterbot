@@ -25,7 +25,7 @@ for key_name in ["GROQ_API_KEYS"] + [f"GROQ_API_KEYS{i}" for i in range(1, 20)]:
 
 # Agar environment variables me kuch nahi mila to default fallback use karein
 if not GROQ_API_KEYS:
-    GROQ_API_KEYS = ["gsk_RZL3YaWBrjd4UjL8Jb3FYzmudELtp459O5wwa0AKIe0NH"]
+    GROQ_API_KEYS = ["hdfh"]
 
 current_key_index = 0
 ai_client = Groq(api_key=GROQ_API_KEYS[current_key_index].strip())
@@ -201,10 +201,9 @@ def get_user_limits(chat_id):
 
 def activate_token_in_db(chat_id, token):
     """
-    Token REPLACE logic (Fixed for owner.py structure): 
-    Jab owner.py token banata hai, toh woh Temp column me plan name dalta hai aur Bot_Token blank rehta hai.
-    Jab hum /activate karenge, tab yeh function us Temp se data utha kar Status me replace karega,
-    purane plans completely overwrite (delete) kar dega, aur sheet ko clean rakhega.
+    FIXED Token REPLACE logic: 
+    owner.py ke banaye gaye empty row me se data replace karega 
+    aur sheet errors ko bachane ke liye safe time.sleep ka use karega.
     """
     global sheet
     if sheet is None:
@@ -213,7 +212,7 @@ def activate_token_in_db(chat_id, token):
         records = sheet.get_all_records()
         headers = sheet.row_values(1)
         
-        # Dynamic Columns Find Karna (Taaki sheet me shift ho toh error na aaye)
+        # Dynamic Columns Find Karna
         status_col = headers.index('Status') + 1 if 'Status' in headers else 6
         plan_token_col = headers.index('PlanToken') + 1 if 'PlanToken' in headers else 7
         temp_col = headers.index('Temp') + 1 if 'Temp' in headers else 11
@@ -223,7 +222,7 @@ def activate_token_in_db(chat_id, token):
         row_status = "Standard"
         assigned_admin_id = ""
 
-        # 1. Wo token find karein jo owner.py ne generate kiya hai (Jisme Bot_Token blank hota hai)
+        # 1. Wo token find karein jo owner.py ne generate kiya hai (Khali Bot_Token ke sath)
         for i, row in enumerate(records):
             if str(row.get('PlanToken', '')).strip() == token and not str(row.get('Bot_Token', '')).strip():
                 token_row_idx = i + 2 # +2 due to header and 0-index
@@ -234,13 +233,11 @@ def activate_token_in_db(chat_id, token):
                 break
 
         if token_row_idx == -1:
-            # Verify if user already activated it
             for row in records:
                 if str(row.get('PlanToken', '')).strip() == token and str(row.get('Admin_ID', '')).strip() == str(chat_id):
                     return None, "Ye plan aapne pehle hi activate kar liya hai!"
             return None, "Token valid nahi mila ya pehle kisi aur dwara use kiya ja chuka hai."
 
-        # Verify Owner specific assignment
         if assigned_admin_id and assigned_admin_id != str(chat_id):
             return None, "Ye token specific user (Kisi aur Admin ID) ke liye generate kiya gaya hai!"
 
@@ -251,19 +248,25 @@ def activate_token_in_db(chat_id, token):
                 admin_rows_indices.append(i + 2)
 
         if admin_rows_indices:
-            # USER EXISTS: User ke sabhi purane rows mein Temp ka Naya Status Replace Karein
+            # USER EXISTS: User ke sabhi purane rows mein Naya Status Replace Karein
             for row_idx in admin_rows_indices:
-                sheet.update_cell(row_idx, status_col, row_status) # Purana Status Replace
-                sheet.update_cell(row_idx, plan_token_col, token)  # Naya Token Apply
-                sheet.update_cell(row_idx, temp_col, "")           # Extra safety cleanup
+                sheet.update_cell(row_idx, status_col, row_status)
+                time.sleep(0.5) # Rate Limit Error Bypass
+                sheet.update_cell(row_idx, plan_token_col, token) 
+                time.sleep(0.5)
             
-            # Jo owner.py ne temp row banayi thi ab uska kaam khatam, use delete kar dein (Sheet Clean!)
+            # IMPORTANT: Purana plan replace hote hi owner.py wali Khali Row DELETE ho jayegi!
             sheet.delete_row(token_row_idx)
+            time.sleep(0.5)
         else:
-            # NEW USER: Ekdum naya user hai. Ussi row ko use kar lenge.
-            sheet.update_cell(token_row_idx, admin_id_col, str(chat_id)) # Link Chat ID
-            sheet.update_cell(token_row_idx, status_col, row_status)     # Move Temp plan to actual Status
-            sheet.update_cell(token_row_idx, temp_col, "")               # Clean the Temp Column
+            # NEW USER: Inke paas abhi bot nahi hai, toh yehi row unki basic ID ban jayegi
+            sheet.update_cell(token_row_idx, admin_id_col, str(chat_id))
+            time.sleep(0.5)
+            sheet.update_cell(token_row_idx, status_col, row_status)
+            time.sleep(0.5)
+            # Khali row ki 'Temp' column empty (clear) kar dena chahiye
+            sheet.update_cell(token_row_idx, temp_col, "") 
+            time.sleep(0.5)
                 
         plan_name, max_bots, max_chars, is_trial = parse_status(row_status)
         return {
@@ -274,7 +277,7 @@ def activate_token_in_db(chat_id, token):
         }, None
     except Exception as e:
         print("Token activation error:", e)
-        return None, f"Database update fail ho gaya: {e}"
+        return None, f"Database update fail ho gaya: API Error (Too Many Requests). Kripya thodi der baad try karein."
 
 def extract_text_from_url(base_url, max_pages=5, max_chars=15000):
     try:
@@ -335,9 +338,11 @@ def save_to_sheet(admin_id, bot_token, username, context_data):
         
     active_status = "Trial"
     active_token = ""
+    empty_row_indices = []
+    
     try:
         records = sheet.get_all_records()
-        for row in records:
+        for i, row in enumerate(records):
             if str(row.get('Admin_ID', '')).strip() == str(admin_id):
                 row_status = str(row.get('Status', 'Trial')).strip()
                 row_plan_token = str(row.get('PlanToken', '')).strip()
@@ -351,8 +356,20 @@ def save_to_sheet(admin_id, bot_token, username, context_data):
                 elif "custom" in row_status.lower() and "premium" not in active_status.lower() and "standard" not in active_status.lower():
                     active_status = row_status
                     active_token = row_plan_token
+                
+                # Sheet ko clean rakhne ke liye Ghost (Khali) rows find karna
+                if not str(row.get('Bot_Token', '')).strip():
+                    empty_row_indices.append(i + 2)
     except Exception as e:
         print("Error checking status during bot save:", e)
+
+    # Naya bot bante waqt purani Khali row delete kar dena taaki sheet bhare na
+    try:
+        for idx in reversed(empty_row_indices):
+            sheet.delete_row(idx)
+            time.sleep(1)
+    except Exception as e:
+        print("Error clearing empty placeholder row:", e)
 
     context_str = str(context_data) if context_data else "No Context"
     
