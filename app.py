@@ -203,7 +203,8 @@ def activate_token_in_db(chat_id, token):
     """
     FIXED Token REPLACE logic: 
     owner.py ke banaye gaye empty row me se data replace karega 
-    aur sheet errors ko bachane ke liye safe time.sleep ka use karega.
+    aur sheet errors (shifting) ko bachane ke liye DELETE ka istemal nahi hoga.
+    Sirf us empty row ka data CLEAR kiya jayega taaki wo dobara use ho sake.
     """
     global sheet
     if sheet is None:
@@ -255,8 +256,14 @@ def activate_token_in_db(chat_id, token):
                 sheet.update_cell(row_idx, plan_token_col, token) 
                 time.sleep(0.5)
             
-            # IMPORTANT: Purana plan replace hote hi owner.py wali Khali Row DELETE ho jayegi!
-            sheet.delete_row(token_row_idx)
+            # IMPORTANT: Purana plan replace hote hi owner.py wali Khali Row CLEAR hogi, DELETE nahi! (No Shifting Error)
+            sheet.update_cell(token_row_idx, admin_id_col, "")
+            time.sleep(0.5)
+            sheet.update_cell(token_row_idx, plan_token_col, "")
+            time.sleep(0.5)
+            sheet.update_cell(token_row_idx, temp_col, "")
+            time.sleep(0.5)
+            sheet.update_cell(token_row_idx, status_col, "")
             time.sleep(0.5)
         else:
             # NEW USER: Inke paas abhi bot nahi hai, toh yehi row unki basic ID ban jayegi
@@ -357,19 +364,11 @@ def save_to_sheet(admin_id, bot_token, username, context_data):
                     active_status = row_status
                     active_token = row_plan_token
                 
-                # Sheet ko clean rakhne ke liye Ghost (Khali) rows find karna
-                if not str(row.get('Bot_Token', '')).strip():
-                    empty_row_indices.append(i + 2)
+            # Sheet ko clean rakhne ke liye sirf completely Blank/Clear rows find karna (Taki dobara use kar sake)
+            if not str(row.get('Admin_ID', '')).strip() and not str(row.get('Bot_Token', '')).strip() and not str(row.get('PlanToken', '')).strip():
+                empty_row_indices.append(i + 2)
     except Exception as e:
         print("Error checking status during bot save:", e)
-
-    # Naya bot bante waqt purani Khali row delete kar dena taaki sheet bhare na
-    try:
-        for idx in reversed(empty_row_indices):
-            sheet.delete_row(idx)
-            time.sleep(1)
-    except Exception as e:
-        print("Error clearing empty placeholder row:", e)
 
     context_str = str(context_data) if context_data else "No Context"
     
@@ -386,8 +385,18 @@ def save_to_sheet(admin_id, bot_token, username, context_data):
             for chunk in chunks:
                 # Basic Structure: Admin_ID, Bot_Token, Username, Context, Join_Date, Status, PlanToken
                 new_row = [str(admin_id), str(bot_token), str(username), chunk, join_date, active_status, active_token]
-                sheet.append_row(new_row)
-                time.sleep(1) # Delay for multi-row logic safety
+                
+                # Agar koi khali (cleared) row mojood hai toh use hi overwrite karke reuse karo! (No Appending unless required)
+                if empty_row_indices:
+                    reuse_idx = empty_row_indices.pop(0)
+                    cell_list = sheet.range(f'A{reuse_idx}:G{reuse_idx}')
+                    for col_idx, val in enumerate(new_row):
+                        cell_list[col_idx].value = val
+                    sheet.update_cells(cell_list)
+                    time.sleep(1)
+                else:
+                    sheet.append_row(new_row)
+                    time.sleep(1) # Delay for multi-row logic safety
                 
             print("Data system database me safely save ho gaya!")
             bot_tokens_cache[username.lower()] = bot_token
@@ -406,9 +415,10 @@ def append_context_to_sheet(token, extra_context):
     try:
         records = sheet.get_all_records()
         bot_rows = []
+        empty_row_indices = []
         admin_id, username, status, plan_token, join_date = "", "", "", "", ""
         
-        # Purane sabhi chunks (rows) find karein
+        # Purane sabhi chunks (rows) aur Khali (Reusable) rows find karein
         for i, row in enumerate(records):
             if str(row.get('Bot_Token', '')).strip() == str(token).strip():
                 bot_rows.append({'index': i + 2, 'context': str(row.get('Context', ''))})
@@ -418,6 +428,9 @@ def append_context_to_sheet(token, extra_context):
                     status = str(row.get('Status', ''))
                     plan_token = str(row.get('PlanToken', ''))
                     join_date = str(row.get('Join_Date', ''))
+                    
+            if not str(row.get('Admin_ID', '')).strip() and not str(row.get('Bot_Token', '')).strip() and not str(row.get('PlanToken', '')).strip():
+                empty_row_indices.append(i + 2)
                     
         if not bot_rows:
             return None
@@ -439,10 +452,18 @@ def append_context_to_sheet(token, extra_context):
                 sheet.update_cell(row_idx, 4, chunk)
                 time.sleep(1)
             else:
-                # Agar limit par kar gaye to doosri row add karein!
+                # Agar limit par kar gaye to doosri row add karein, (Reusable row mile toh wo use karo)
                 new_row = [admin_id, token, username, chunk, join_date, status, plan_token]
-                sheet.append_row(new_row)
-                time.sleep(1)
+                if empty_row_indices:
+                    reuse_idx = empty_row_indices.pop(0)
+                    cell_list = sheet.range(f'A{reuse_idx}:G{reuse_idx}')
+                    for col_idx, val in enumerate(new_row):
+                        cell_list[col_idx].value = val
+                    sheet.update_cells(cell_list)
+                    time.sleep(1)
+                else:
+                    sheet.append_row(new_row)
+                    time.sleep(1)
                 
         return full_context
     except Exception as e:
