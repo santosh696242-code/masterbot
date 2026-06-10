@@ -25,7 +25,7 @@ for key_name in ["GROQ_API_KEYS"] + [f"GROQ_API_KEYS{i}" for i in range(1, 20)]:
 
 # Agar environment variables me kuch nahi mila to default fallback use karein
 if not GROQ_API_KEYS:
-    GROQ_API_KEYS = ["df"]
+    GROQ_API_KEYS = ["fg"]
 
 current_key_index = 0
 ai_client = Groq(api_key=GROQ_API_KEYS[current_key_index].strip())
@@ -179,7 +179,9 @@ def get_user_limits(chat_id):
         records = sheet.get_all_records()
         user_rows = [row for row in records if str(row.get('Admin_ID', '')).strip() == str(chat_id)]
         
-        user_bots_count = sum(1 for r in user_rows if str(r.get('Bot_Token', '')).strip())
+        # Ek bot multiple rows le sakta hai, isliye unique tokens count karenge
+        unique_tokens = set(str(r.get('Bot_Token', '')).strip() for r in user_rows if str(r.get('Bot_Token', '')).strip())
+        user_bots_count = len(unique_tokens)
         
         for row in user_rows:
             status = str(row.get('Status', 'Trial')).strip()
@@ -338,14 +340,21 @@ def save_to_sheet(admin_id, bot_token, username, context_data):
 
     context_str = str(context_data) if context_data else "No Context"
     
-    # Matching column structure: [Admin_ID, Bot_Token, Username, Context, Join_Date, Status, PlanToken]
-    new_row = [str(admin_id), str(bot_token), str(username), context_str, join_date, active_status, active_token]
+    # 50,000 cell limit se bachne ke liye data ko 49000 chars ke chunks me todna
+    CHUNK_SIZE = 49000
+    chunks = [context_str[i:i+CHUNK_SIZE] for i in range(0, len(context_str), CHUNK_SIZE)]
+    if not chunks:
+        chunks = ["No Context"]
     
     max_retries = 3
     for attempt in range(max_retries):
         try:
             print(f"Database me data save kar raha hoon... (Attempt {attempt + 1}/{max_retries})")
-            sheet.append_row(new_row)
+            for chunk in chunks:
+                new_row = [str(admin_id), str(bot_token), str(username), chunk, join_date, active_status, active_token]
+                sheet.append_row(new_row)
+                time.sleep(1) # Multiple rows limit na lage isliye delay
+            
             print("Data system database me safely save ho gaya!")
             bot_tokens_cache[username.lower()] = bot_token
             return join_date
@@ -362,14 +371,47 @@ def append_context_to_sheet(token, extra_context):
         return False
     try:
         records = sheet.get_all_records()
+        
+        bot_rows = []
+        admin_id, username, status, plan_token, join_date = "", "", "", "", ""
+        
+        # Purane sabhi rows find karein
         for i, row in enumerate(records):
             if str(row.get('Bot_Token', '')).strip() == str(token).strip():
-                existing_context = str(row.get('Context', ''))
-                updated_context = existing_context + "\n\n--- Extra Data ---\n\n" + extra_context
+                bot_rows.append({'index': i + 2, 'context': str(row.get('Context', ''))})
+                if not admin_id:
+                    admin_id = str(row.get('Admin_ID', ''))
+                    username = str(row.get('Username', ''))
+                    status = str(row.get('Status', ''))
+                    plan_token = str(row.get('PlanToken', ''))
+                    join_date = str(row.get('Join_Date', ''))
+        
+        if not bot_rows:
+            return None
+            
+        # Purana sara data combine karein aur naya data add karein
+        full_context = ""
+        for r in bot_rows:
+            full_context += r['context'] + "\n\n"
+        full_context += "--- Extra Data ---\n\n" + extra_context
+        
+        # Fir se data chunk karein naye size ke anusaar
+        CHUNK_SIZE = 49000
+        chunks = [full_context[i:i+CHUNK_SIZE] for i in range(0, len(full_context), CHUNK_SIZE)]
+        
+        for j, chunk in enumerate(chunks):
+            if j < len(bot_rows):
+                # Agar row pehle se hai to update karein
+                row_idx = bot_rows[j]['index']
+                sheet.update_cell(row_idx, 4, chunk)
+                time.sleep(1)
+            else:
+                # Limit cross hui to naya row banayein (Doosra Row)
+                new_row = [admin_id, token, username, chunk, join_date, status, plan_token]
+                sheet.append_row(new_row)
+                time.sleep(1)
                 
-                sheet.update_cell(i + 2, 4, updated_context)
-                return updated_context
-        return None
+        return full_context
     except Exception as e:
         print(f"Error updating DB: {e}")
         return False
@@ -891,24 +933,43 @@ def run_bot():
     if sheet is not None:
         try:
             all_records = sheet.get_all_records()
-            print(f"Total {len(all_records)} clients found in DB.")
+            print(f"Total {len(all_records)} rows found in DB.")
+            
+            # Context Aggregation: Ek bot ke sabhi multiple rows ka data jodne ke liye
+            bot_data_map = {}
             for row in all_records:
-                status = str(row.get('Status', '')).strip()
                 token = str(row.get('Bot_Token', '')).strip()
-                username = str(row.get('Username', '')).strip()
-                join_date = str(row.get('Join_Date', '')).strip()
+                if not token: continue
                 
-                if username and token:
+                username = str(row.get('Username', '')).strip()
+                status = str(row.get('Status', '')).strip()
+                join_date = str(row.get('Join_Date', '')).strip()
+                context = str(row.get('Context', ''))
+                
+                if token not in bot_data_map:
+                    bot_data_map[token] = {
+                        'username': username,
+                        'status': status,
+                        'join_date': join_date,
+                        'context': context
+                    }
+                else:
+                    bot_data_map[token]['context'] += "\n\n" + context
+
+            # Aggregated data se bots memory load karein
+            for token, data in bot_data_map.items():
+                username = data['username']
+                if username:
                     bot_tokens_cache[username.lower()] = token
                     
-                plan_name, max_bots, max_chars, is_trial = parse_status(status)
+                plan_name, max_bots, max_chars, is_trial = parse_status(data['status'])
                 
                 is_active = True
-                if is_trial and join_date:
-                    is_active, _ = check_trial_status(join_date)
+                if is_trial and data['join_date']:
+                    is_active, _ = check_trial_status(data['join_date'])
                 
-                if is_active and token:
-                    start_client_bot(token, row.get('Context', ''), join_date, status)
+                if is_active:
+                    start_client_bot(token, data['context'], data['join_date'], data['status'])
         except Exception as e:
             print("Purane bots load nahi ho paye.", e)
     else:
