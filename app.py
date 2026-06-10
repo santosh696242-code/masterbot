@@ -501,6 +501,7 @@ def start_client_bot(token, context, join_date_str, status="Trial"):
                     f"• <b>Telegram DM:</b> {DEVELOPER_TELEGRAM}\n"
                     f"• <b>WhatsApp:</b> {ADMIN_PHONE}\n"
                     f"• <b>Emails:</b> {ADMIN_EMAIL_1}, {ADMIN_EMAIL_2}\n\n"
+                    f"🤖 help for @santosh_devloperbot and /help
                     "<i>Apne AI assistant ko dobara active karne ke liye abhi contact karein!</i>"
                 )
                 client_bot.reply_to(message, expired_msg, parse_mode="HTML")
