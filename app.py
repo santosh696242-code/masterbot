@@ -612,7 +612,7 @@ def master_help(message):
         "• <b>Private:</b> Customers direct bot ko /start bhej kar baat kar sakte hain.\n"
         "• <b>Groups:</b> Apne bot ko group me add karein aur use Admin permissions dein.\n\n"
         "🤖 <b>@santosh_devloperbot Use this for More information.</b>\n\n"
-        f"📞 Support support ke liye <code>/contact</code> command ka use karein."
+        f"📞 Support support ke liye /contact command ka use karein."
     )
     master_bot.reply_to(message, help_text, parse_mode="HTML")
 
